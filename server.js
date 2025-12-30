@@ -41,10 +41,10 @@ app.use(session({
 // Configuration
 const CONFIG = {
     cognito: {
-        domain: 'us-east-1oy2eu7gpq.auth.us-east-1.amazoncognito.com', // Replace with your Cognito domain
-        userPoolUrl: 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_OY2eU7GPq',
-        clientId: '3o1moi7kpbon75fpli0dq1p84b',
-        clientSecret: '1nno9pmjr450erv0hgofh5o3og5af40vshin5kkclsclig7imhjp', // Replace with actual secret
+        domain: 'us-east-1oy2zxxxxxgpq.auth.us-east-1.amazoncognito.com', // Replace with your Cognito domain
+        userPoolUrl: 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_OY2XXX7GPq',
+        clientId: '3o1moi7kpbonxxxxxli0dq1p84b',
+        clientSecret: '1nno9pmjr450erv0hgofxxxxxxxxxx5af40vshin5kkclsclig7imhjp', // Replace with actual secret
         callbackUrl: 'https://cognito-alb-1271424632.us-east-1.elb.amazonaws.com/callback',
         logoutUrl: 'https://cognito-alb-1271424632.us-east-1.elb.amazonaws.com'
     },
