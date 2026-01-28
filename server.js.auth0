@@ -1,0 +1,476 @@
+const https = require('https');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { CloudWatchLogsClient, GetLogEventsCommand } = require('@aws-sdk/client-cloudwatch-logs');
+const cors = require('cors');
+const express = require('express');
+const session = require('express-session');
+const jwt = require('jsonwebtoken');
+const jwksClient = require('jwks-rsa');
+
+const app = express();
+
+// SSL configuration (for direct HTTPS access, optional if only through ALB)
+let sslOptions = null;
+try {
+    sslOptions = {
+        key: fs.readFileSync('/root/ssl-certificates/private.key'),
+        cert: fs.readFileSync('/root/ssl-certificates/certificate.pem')
+    };
+} catch (err) {
+    console.log('SSL certificates not found, HTTPS server will not start');
+}
+
+// Enhanced CORS configuration
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+// Parse JSON bodies
+app.use(express.json());
+
+// View engine setup
+app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, 'views'));
+
+// Session middleware
+app.use(session({
+    secret: 'your-secret-key-change-in-production',
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+        secure: process.env.NODE_ENV === 'production',
+        maxAge: 24 * 60 * 60 * 1000 // 24 hours
+    }
+}));
+
+// ============================================
+// CONFIGURATION - Auth0 + ALB
+// ============================================
+const CONFIG = {
+    auth0: {
+        domain: 'dev-jmje1n8q2sb1gexa.us.auth0.com',
+        issuer: 'https://dev-jmje1n8q2sb1gexa.us.auth0.com/',
+        authorizationEndpoint: 'https://dev-jmje1n8q2sb1gexa.us.auth0.com/authorize',
+        tokenEndpoint: 'https://dev-jmje1n8q2sb1gexa.us.auth0.com/oauth/token',
+        userInfoEndpoint: 'https://dev-jmje1n8q2sb1gexa.us.auth0.com/userinfo',
+        clientId: '1T6LgIPRJxrdjbWtTmRXdVM6YQAtI8MZ',           // Replace with your Auth0 Client ID
+        clientSecret: '_DMZXouDsH8qEKavl_2VPnkTn-TDHdwejF8jfHkA4ujLDsfEib9CGXwX9gu3OcUk',   // Replace with your Auth0 Client Secret
+        // Logout URL for Auth0
+        logoutUrl: 'https://dev-jmje1n8q2sb1gexa.us.auth0.com/v2/logout'
+    },
+    alb: {
+        // Your ALB DNS name
+        dnsName: 'test-alb-900587091.us-east-1.elb.amazonaws.com',  // Replace with your ALB DNS
+        // ALB region for JWKS endpoint
+        region: 'us-east-1'
+    },
+    server: {
+        host: '0.0.0.0',  // Listen on all interfaces for ALB health checks
+        httpPort: 3001,
+        httpsPort: 443
+    }
+};
+
+// ============================================
+// ALB JWKS CLIENT (for verifying ALB-signed tokens)
+// ============================================
+const albJwksClient = jwksClient({
+    jwksUri: `https://public-keys.auth.elb.${CONFIG.alb.region}.amazonaws.com`,
+    cache: true,
+    cacheMaxAge: 86400000 // 24 hours
+});
+
+// Function to get ALB signing key
+function getAlbSigningKey(header, callback) {
+    albJwksClient.getSigningKey(header.kid, (err, key) => {
+        if (err) {
+            callback(err);
+            return;
+        }
+        const signingKey = key.getPublicKey();
+        callback(null, signingKey);
+    });
+}
+
+// Initialize CloudWatch client
+const cloudWatchClient = new CloudWatchLogsClient({
+    region: 'us-east-1',
+});
+
+// ============================================
+// ALB AUTHENTICATION MIDDLEWARE
+// ============================================
+
+/**
+ * Middleware to extract and verify user info from ALB OIDC headers
+ * ALB adds these headers after successful authentication:
+ * - X-AMZN-OIDC-AccessToken: The access token from Auth0
+ * - X-AMZN-OIDC-Identity: The user's subject (sub) claim
+ * - X-AMZN-OIDC-Data: JWT containing user claims, signed by ALB
+ */
+const extractAlbUserInfo = async (req, res, next) => {
+    try {
+        // Get ALB headers
+        const accessToken = req.headers['x-amzn-oidc-accesstoken'];
+        const identity = req.headers['x-amzn-oidc-identity'];
+        const data = req.headers['x-amzn-oidc-data'];
+
+        // If no ALB headers, user is not authenticated through ALB
+        if (!data) {
+            req.isAuthenticated = false;
+            req.userInfo = null;
+            return next();
+        }
+
+        // Decode and verify the ALB-signed JWT
+        // The X-AMZN-OIDC-Data header contains user claims signed by ALB
+        const decoded = await verifyAlbToken(data);
+
+        req.isAuthenticated = true;
+        req.userInfo = {
+            sub: identity || decoded.sub,
+            email: decoded.email,
+            name: decoded.name,
+            picture: decoded.picture,
+            nickname: decoded.nickname,
+            // Include all claims from the token
+            ...decoded
+        };
+        req.accessToken = accessToken;
+
+        // Also store in session for convenience
+        req.session.userInfo = req.userInfo;
+        req.session.accessToken = accessToken;
+
+        console.log('User authenticated via ALB:', req.userInfo.email || req.userInfo.sub);
+
+        next();
+    } catch (error) {
+        console.error('Error extracting ALB user info:', error);
+        req.isAuthenticated = false;
+        req.userInfo = null;
+        next();
+    }
+};
+
+/**
+ * Verify ALB-signed JWT token
+ * ALB signs the X-AMZN-OIDC-Data token with its own key
+ */
+function verifyAlbToken(token) {
+    return new Promise((resolve, reject) => {
+        // First, decode header to get key ID
+        const decodedHeader = jwt.decode(token, { complete: true });
+
+        if (!decodedHeader) {
+            // If can't decode as JWT, try base64 decode (ALB sometimes sends plain base64)
+            try {
+                const decoded = JSON.parse(Buffer.from(token, 'base64').toString('utf8'));
+                resolve(decoded);
+                return;
+            } catch (e) {
+                reject(new Error('Invalid token format'));
+                return;
+            }
+        }
+
+        // Verify the JWT signature using ALB's public key
+        jwt.verify(token, getAlbSigningKey, {
+            algorithms: ['ES256']  // ALB uses ES256
+        }, (err, decoded) => {
+            if (err) {
+                console.error('JWT verification error:', err.message);
+                // If verification fails, still try to use decoded data (for development)
+                if (decodedHeader && decodedHeader.payload) {
+                    console.warn('Using unverified token data (not recommended for production)');
+                    resolve(decodedHeader.payload);
+                } else {
+                    reject(err);
+                }
+            } else {
+                resolve(decoded);
+            }
+        });
+    });
+}
+
+/**
+ * Simple middleware to check if user is authenticated
+ */
+const checkAuth = (req, res, next) => {
+    // Check ALB headers first
+    const albData = req.headers['x-amzn-oidc-data'];
+
+    if (albData) {
+        req.isAuthenticated = true;
+    } else if (req.session && req.session.userInfo) {
+        req.isAuthenticated = true;
+        req.userInfo = req.session.userInfo;
+    } else {
+        req.isAuthenticated = false;
+    }
+
+    next();
+};
+
+/**
+ * Middleware to require authentication
+ */
+const requireAuth = (req, res, next) => {
+    if (!req.isAuthenticated) {
+        return res.status(401).json({
+            error: 'Unauthorized',
+            message: 'Authentication required',
+            timestamp: new Date().toISOString()
+        });
+    }
+    next();
+};
+
+// ============================================
+// ROUTES
+// ============================================
+
+// Apply ALB user extraction to all routes
+app.use(extractAlbUserInfo);
+
+// Home route
+app.get('/', (req, res) => {
+    res.render('home', {
+        isAuthenticated: req.isAuthenticated,
+        userInfo: req.userInfo || {}
+    });
+});
+
+// Login route - Redirects to ALB/Auth0 login
+// When using ALB auth, the ALB automatically redirects unauthenticated users
+// This route is for explicit login requests
+app.get('/login', (req, res) => {
+    // If already authenticated, redirect to home
+    if (req.isAuthenticated) {
+        return res.redirect('/');
+    }
+
+    // When using ALB authentication, simply redirect to a protected resource
+    // ALB will handle the redirect to Auth0
+    res.redirect('/');
+});
+
+// Callback route - ALB handles this automatically
+// This route is kept for compatibility but ALB handles the OAuth callback
+app.get('/callback', (req, res) => {
+    // ALB handles the callback automatically
+    // If we reach here, authentication was successful
+    console.log('Callback reached - ALB handled authentication');
+    res.redirect('/');
+});
+
+// OAuth2 IDP Response - ALB's callback endpoint
+// ALB uses /oauth2/idpresponse as its callback URL
+app.get('/oauth2/idpresponse', (req, res) => {
+    // This is handled by ALB, but included for completeness
+    console.log('IdP response received - ALB handling');
+    res.redirect('/');
+});
+
+// Health check route (important for ALB health checks)
+app.get('/health', (req, res) => {
+    res.status(200).json({
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        service: 'auth0-alb-app'
+    });
+});
+
+// User info endpoint
+app.get('/api/userinfo', (req, res) => {
+    if (!req.isAuthenticated) {
+        return res.status(401).json({
+            error: 'Not authenticated',
+            timestamp: new Date().toISOString()
+        });
+    }
+
+    res.json({
+        authenticated: true,
+        user: req.userInfo,
+        timestamp: new Date().toISOString()
+    });
+});
+
+// Protected API endpoint - Get user profile
+app.get('/api/profile', requireAuth, (req, res) => {
+    res.json({
+        user: req.userInfo,
+        timestamp: new Date().toISOString()
+    });
+});
+
+// Logs endpoint
+app.get('/api/logs', checkAuth, async (req, res) => {
+    // Optional: Require authentication for logs
+    // if (!req.isAuthenticated) {
+    //     return res.status(401).json({ error: 'Unauthorized' });
+    // }
+
+    console.log('Received request for logs at:', new Date().toISOString());
+    console.log('Requested by:', req.userInfo?.email || 'anonymous');
+
+    try {
+        const params = {
+            logGroupName: 'test',
+            logStreamName: 'custom',
+            limit: 100,
+            startFromHead: true
+        };
+
+        console.log('Fetching logs with params:', params);
+
+        const command = new GetLogEventsCommand(params);
+        const response = await cloudWatchClient.send(command);
+
+        console.log(`Successfully fetched ${response.events.length} logs`);
+
+        const responseData = {
+            timestamp: new Date().toISOString(),
+            requestedBy: req.userInfo?.email || 'anonymous',
+            events: response.events,
+            nextForwardToken: response.nextForwardToken,
+            nextBackwardToken: response.nextBackwardToken
+        };
+
+        res.json(responseData);
+
+    } catch (error) {
+        console.error('Error fetching logs:', error);
+
+        res.status(500).json({
+            error: error.message,
+            timestamp: new Date().toISOString(),
+            details: {
+                code: error.code,
+                requestId: error.$metadata?.requestId,
+                cfId: error.$metadata?.cfId
+            }
+        });
+    }
+});
+
+// Logout route - Auth0 logout
+app.get('/logout', (req, res) => {
+    const userEmail = req.userInfo?.email || req.session?.userInfo?.email;
+    console.log('User logging out:', userEmail);
+
+    // Destroy local session
+    req.session.destroy((err) => {
+        if (err) {
+            console.error('Session destruction error:', err);
+        }
+
+        // Redirect to Auth0 logout endpoint
+        // After logout, Auth0 will redirect back to your application
+        const returnTo = encodeURIComponent(`https://${CONFIG.alb.dnsName}`);
+        const logoutUrl = `${CONFIG.auth0.logoutUrl}?client_id=${CONFIG.auth0.clientId}&returnTo=${returnTo}`;
+
+        console.log('Redirecting to Auth0 logout:', logoutUrl);
+        res.redirect(logoutUrl);
+    });
+});
+
+// Debug endpoint - Show all headers (useful for debugging ALB integration)
+app.get('/debug/headers', (req, res) => {
+    // Only enable in development
+    if (process.env.NODE_ENV === 'production') {
+        return res.status(404).json({ error: 'Not found' });
+    }
+
+    const albHeaders = {
+        'x-amzn-oidc-accesstoken': req.headers['x-amzn-oidc-accesstoken'] ? '[PRESENT]' : '[MISSING]',
+        'x-amzn-oidc-identity': req.headers['x-amzn-oidc-identity'] || '[MISSING]',
+        'x-amzn-oidc-data': req.headers['x-amzn-oidc-data'] ? '[PRESENT]' : '[MISSING]'
+    };
+
+    res.json({
+        timestamp: new Date().toISOString(),
+        albHeaders,
+        isAuthenticated: req.isAuthenticated,
+        userInfo: req.userInfo,
+        allHeaders: Object.keys(req.headers)
+    });
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+    console.error('Unhandled error:', err);
+    res.status(500).json({
+        error: 'Internal Server Error',
+        message: process.env.NODE_ENV === 'production' ? 'An error occurred' : err.message,
+        timestamp: new Date().toISOString()
+    });
+});
+
+// 404 handler
+app.use((req, res) => {
+    res.status(404).json({
+        error: 'Not Found',
+        path: req.path,
+        timestamp: new Date().toISOString()
+    });
+});
+
+
+
+async function startServer() {
+    try {
+        // Create HTTP server (for ALB communication - ALB terminates SSL)
+        const httpServer = http.createServer(app);
+
+        // Start HTTP server
+        httpServer.listen(CONFIG.server.httpPort, CONFIG.server.host, () => {
+            console.log('='.repeat(60));
+            console.log(`Server started at ${new Date().toISOString()}`);
+            console.log(`HTTP server running on http://${CONFIG.server.host}:${CONFIG.server.httpPort}`);
+            console.log('='.repeat(60));
+            console.log('Configuration:');
+            console.log(`  Auth0 Domain: ${CONFIG.auth0.domain}`);
+            console.log(`  ALB DNS: ${CONFIG.alb.dnsName}`);
+            console.log(`  Environment: ${process.env.NODE_ENV || 'development'}`);
+            console.log('='.repeat(60));
+            console.log('ALB Headers Expected:');
+            console.log('  X-AMZN-OIDC-AccessToken: Access token from Auth0');
+            console.log('  X-AMZN-OIDC-Identity: User subject (sub)');
+            console.log('  X-AMZN-OIDC-Data: JWT with user claims');
+            console.log('='.repeat(60));
+        });
+
+        // Optionally start HTTPS server for direct access
+        if (sslOptions) {
+            const httpsServer = https.createServer(sslOptions, app);
+            httpsServer.listen(CONFIG.server.httpsPort, CONFIG.server.host, () => {
+                console.log(`HTTPS server running on https://${CONFIG.server.host}:${CONFIG.server.httpsPort}`);
+            });
+        }
+
+    } catch (error) {
+        console.error('Failed to start server:', error);
+        process.exit(1);
+    }
+}
+
+// Start the server
+startServer();
+
+// Handle unhandled rejections
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+    console.error('Uncaught Exception:', error);
+    process.exit(1);
+});
